@@ -102,11 +102,14 @@ class KVCache:
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         # Previous token's normalized embedding for smear (set by model forward pass)
         self.prev_embedding = None
+        # Previous token ids for lexical front-end features during decoding
+        self.prev_token_ids = None
 
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
         self.prev_embedding = None
+        self.prev_token_ids = None
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -135,6 +138,8 @@ class KVCache:
         # Copy smear state: expand batch=1 prev_embedding to num_samples
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+        if other.prev_token_ids is not None:
+            self.prev_token_ids = other.prev_token_ids.expand(self.batch_size).clone()
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
@@ -177,13 +182,9 @@ class Engine:
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
-        # NOTE: setting the dtype here and in this way is an ugly hack.
-        # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
-        # We need to know the dtype here to call __init__ on KVCache and pre-allocate its tensors.
-        # As a quick hack, we're making generate() function inherit and know about this repo-wise assumption.
-        # I think there has to be a bigger refactor to deal with device/dtype tracking across the codebase.
-        # In particular, the KVCache should allocate its tensors lazily
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        # Infer KV-cache dtype from the model instead of hard-coding by device type.
+        embedding = getattr(getattr(self.model, "transformer", None), "wte", None)
+        dtype = embedding.weight.dtype if embedding is not None else (torch.bfloat16 if device.type == "cuda" else torch.float32)
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 

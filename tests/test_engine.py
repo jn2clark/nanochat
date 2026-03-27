@@ -155,6 +155,25 @@ def test_kv_cache_prefill():
     assert (dst_cache.v_cache[0, 0, :16, :, :] == 2.0).all()
 
 
+def test_kv_cache_prefill_copies_frontend_state():
+    """Prefill should preserve extra decode state used by smear/bigram front-ends."""
+    src_cache = KVCache(
+        batch_size=1, num_heads=2, seq_len=16,
+        head_dim=8, num_layers=2, device="cpu", dtype=torch.float32,
+    )
+    src_cache.prev_embedding = torch.randn(1, 1, 32)
+    src_cache.prev_token_ids = torch.tensor([17], dtype=torch.long)
+
+    dst_cache = KVCache(
+        batch_size=3, num_heads=2, seq_len=32,
+        head_dim=8, num_layers=2, device="cpu", dtype=torch.float32,
+    )
+    dst_cache.prefill(src_cache)
+
+    assert dst_cache.prev_embedding.shape == (3, 1, 32)
+    assert torch.equal(dst_cache.prev_token_ids, torch.tensor([17, 17, 17], dtype=torch.long))
+
+
 def test_multi_sample_first_token_diversity():
     """
     Test that when generating multiple samples, each sample gets an independently

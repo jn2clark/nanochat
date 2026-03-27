@@ -52,6 +52,36 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--sparse-funnel", action="store_true", help="use sparse funnel architecture instead of the dense window-pattern schedule")
+parser.add_argument("--n-global", type=int, default=4, help="number of sparse-funnel global (full-context) layers")
+parser.add_argument("--chirp-gamma", type=float, default=0.7, help="chirp exponent for sparse global layer placement")
+parser.add_argument("--local-window", type=int, default=64, help="sparse-funnel local attention window size")
+parser.add_argument("--global-layers", type=str, default="", help="explicit sparse global layer indices, comma-separated")
+parser.add_argument("--local-mlp-ratio", type=int, default=4, help="MLP ratio for sparse local layers")
+parser.add_argument("--rope-base", type=int, default=100000, help="RoPE base frequency")
+parser.add_argument("--smear", dest="smear", action="store_true", help="enable smear front-end mixing")
+parser.add_argument("--no-smear", dest="smear", action="store_false", help="disable smear front-end mixing")
+parser.set_defaults(smear=True)
+parser.add_argument("--smear-channels", type=int, default=24, help="embedding channels used by the smear gate")
+parser.add_argument("--backout", dest="backout", action="store_true", help="enable mid-layer backout before final norm")
+parser.add_argument("--no-backout", dest="backout", action="store_false", help="disable mid-layer backout before final norm")
+parser.set_defaults(backout=True)
+parser.add_argument("--value-embeds", dest="value_embeds", action="store_true", help="enable alternating value embeddings")
+parser.add_argument("--no-value-embeds", dest="value_embeds", action="store_false", help="disable value embeddings")
+parser.set_defaults(value_embeds=True)
+parser.add_argument("--ve-layers", type=str, default="", help="explicit value-residual layer indices, comma-separated")
+parser.add_argument("--bigram-vocab-size", type=int, default=0, help="hashed bigram embedding buckets (0 disables)")
+parser.add_argument("--bigram-dim", type=int, default=128, help="bigram embedding dim before projection")
+parser.add_argument("--gated-attn", dest="gated_attn", action="store_true", help="enable lightweight per-head attention output gates")
+parser.add_argument("--no-gated-attn", dest="gated_attn", action="store_false", help="disable lightweight per-head attention output gates")
+parser.set_defaults(gated_attn=False)
+parser.add_argument("--attn-gate-channels", type=int, default=12, help="embedding channels used to predict attention gates")
+parser.add_argument("--attn-gate-layers", type=str, default="", help="explicit attention-gate layer indices, comma-separated")
+parser.add_argument("--init-profile", type=str, default="master", choices=["master", "c7"], help="parameter initialization profile")
+parser.add_argument("--optimizer-profile", type=str, default="master", choices=["master", "c7"], help="optimizer grouping profile")
+parser.add_argument("--embedding-lm-head", dest="embedding_lm_head", action="store_true", help="use the lightweight embedding-style lm_head implementation")
+parser.add_argument("--no-embedding-lm-head", dest="embedding_lm_head", action="store_false", help="use the standard Linear lm_head implementation")
+parser.set_defaults(embedding_lm_head=False)
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -111,7 +141,9 @@ else:
     else:
         print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
+    if args.sparse_funnel:
+        print0(f"WARNING: SDPA fallback will be slow for sparse-funnel local attention (local_window={args.local_window}).")
+    elif args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
@@ -126,6 +158,9 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
+def parse_layer_list(spec):
+    return tuple(int(x) for x in spec.split(",") if x.strip()) if spec else ()
+
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
@@ -133,10 +168,33 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    global_layer_override = parse_layer_list(args.global_layers)
+    ve_layers = parse_layer_list(args.ve_layers)
+    attn_gate_layers = parse_layer_list(args.attn_gate_layers)
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        use_sparse_funnel=args.sparse_funnel,
+        n_global=args.n_global,
+        chirp_gamma=args.chirp_gamma,
+        local_window=args.local_window,
+        global_layer_override=global_layer_override,
+        local_mlp_ratio=args.local_mlp_ratio,
+        rope_base=args.rope_base,
+        use_smear=args.smear,
+        smear_channels=args.smear_channels,
+        use_backout=args.backout,
+        use_value_embeds=args.value_embeds,
+        ve_layers=ve_layers,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        use_gated_attn=args.gated_attn,
+        attn_gate_channels=args.attn_gate_channels,
+        attn_gate_layers=attn_gate_layers,
+        init_profile=args.init_profile,
+        optimizer_profile=args.optimizer_profile,
+        use_embedding_lm_head=args.embedding_lm_head,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
