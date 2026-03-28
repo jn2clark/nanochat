@@ -74,14 +74,15 @@ class Linear(nn.Linear):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
-class EmbeddingLinear(nn.Module):
-    """Lightweight linear layer for lm_head without redundant dtype casting."""
+class EmbeddingLinear(nn.Linear):
+    """Lightweight linear layer for lm_head without redundant dtype casting.
+
+    Subclassing ``nn.Linear`` keeps it compatible with the generic FP8 conversion
+    pass, while the overridden forward preserves the cheaper embedding-style path.
+    """
     def __init__(self, in_features, out_features, bias=False, device=None, dtype=None):
-        super().__init__()
         assert not bias
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        super().__init__(in_features, out_features, bias=False, device=device, dtype=dtype)
 
     def forward(self, x):
         return F.linear(x, self.weight)

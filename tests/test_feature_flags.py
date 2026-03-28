@@ -2,6 +2,7 @@ import math
 
 import torch
 
+from nanochat.fp8 import Float8Linear, convert_to_float8_training
 from nanochat.gpt import EmbeddingLinear, GPT, GPTConfig
 
 
@@ -66,6 +67,7 @@ def test_c7_feature_surface_builds_expected_modules():
     assert model.window_sizes == [(128, 0), (256, 0), (128, 0), (256, 0)]
     assert model.bigram is not None
     assert isinstance(model.lm_head, EmbeddingLinear)
+    assert isinstance(model.lm_head, torch.nn.Linear)
     assert all(block.attn.attn_gate is not None for block in model.transformer.h)
     assert set(model.value_embeds.keys()) == {"1", "3"}
 
@@ -147,3 +149,12 @@ def test_master_optimizer_keeps_smear_and_backout_together():
     assert matched_group is not None
     assert matched_group["kind"] == "adamw"
     assert matched_group["lr"] == 0.2
+
+
+def test_embedding_lm_head_converts_to_fp8():
+    with torch.device("meta"):
+        model = build_model(use_embedding_lm_head=True)
+
+    convert_to_float8_training(model, module_filter_fn=lambda *_: True)
+
+    assert isinstance(model.lm_head, Float8Linear)
