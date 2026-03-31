@@ -24,6 +24,7 @@ from contextlib import contextmanager
 import wandb
 import torch
 import torch.distributed as dist
+import torch._dynamo.config as dynamo_config
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -35,6 +36,13 @@ from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
+
+# Active-depth curriculum mutates integer module members like `active_depth` at
+# runtime. If Dynamo specializes on those ints too aggressively, later growth
+# events can exhaust the recompile cache and fall back to a much slower path.
+dynamo_config.allow_unspec_int_on_nn_module = True
+dynamo_config.recompile_limit = max(int(dynamo_config.recompile_limit), 64)
+dynamo_config.accumulated_recompile_limit = max(int(dynamo_config.accumulated_recompile_limit), 1024)
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -49,6 +57,13 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--initial-active-depth", type=int, default=-1, help="number of active layers to execute at the start inside the final-depth model (-1 = full depth)")
+parser.add_argument("--grow-active-depth-at-step", type=int, default=-1, help="optimization step at which to expand the active layer count (-1 = disable)")
+parser.add_argument("--grow-active-depth-to", type=int, default=-1, help="target active depth after expansion (-1 = final --depth)")
+parser.add_argument("--grow-active-depth-schedule", type=str, default="", help="comma-separated active-depth expansions as step:depth entries; overrides the single-step grow flags when set")
+parser.add_argument("--grow-new-layer-init", type=str, default="copy", choices=["copy", "copy-zeroL"], help="how to initialize newly activated layers during active-depth expansion")
+parser.add_argument("--grow-new-layer-scale", type=float, default=1.0, help="initial residual-output scale for newly activated layers during active-depth growth")
+parser.add_argument("--grow-new-layer-ramp-steps", type=int, default=0, help="number of steps to ramp newly activated layer output scales from --grow-new-layer-scale to 1.0 (0 = keep fixed)")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
@@ -126,6 +141,36 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
+def parse_active_depth_schedule(spec):
+    events = []
+    if not spec:
+        return events
+    for raw_event in spec.split(","):
+        raw_event = raw_event.strip()
+        if not raw_event:
+            continue
+        parts = raw_event.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid --grow-active-depth-schedule entry '{raw_event}'. Expected step:depth."
+            )
+        step_str, depth_str = parts
+        events.append({
+            "step": int(step_str),
+            "target_depth": int(depth_str),
+        })
+    return events
+
+
+def normalize_active_depth_schedule(events):
+    return [
+        {
+            "step": int(event["step"]),
+            "target_depth": int(event["target_depth"]),
+        }
+        for event in events
+    ]
+
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
@@ -160,6 +205,79 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+depth_curriculum_meta = meta_data.get("depth_curriculum") if resuming else None
+default_initial_active_depth = args.initial_active_depth if args.initial_active_depth > 0 else args.depth
+default_grow_active_depth_to = args.grow_active_depth_to if args.grow_active_depth_to > 0 else args.depth
+default_growth_events = parse_active_depth_schedule(args.grow_active_depth_schedule)
+if not default_growth_events and args.grow_active_depth_at_step >= 0:
+    default_growth_events = [{
+        "step": args.grow_active_depth_at_step,
+        "target_depth": default_grow_active_depth_to,
+    }]
+if depth_curriculum_meta is not None:
+    initial_active_depth = int(depth_curriculum_meta.get("initial_active_depth", default_initial_active_depth))
+    saved_growth_events = depth_curriculum_meta.get("growth_events")
+    if saved_growth_events is None:
+        saved_step = depth_curriculum_meta.get("grow_active_depth_at_step", args.grow_active_depth_at_step)
+        saved_target = depth_curriculum_meta.get("grow_active_depth_to", default_grow_active_depth_to)
+        if saved_step is not None and int(saved_step) >= 0:
+            saved_growth_events = [{
+                "step": int(saved_step),
+                "target_depth": int(saved_target),
+            }]
+        else:
+            saved_growth_events = []
+    growth_events = normalize_active_depth_schedule(saved_growth_events)
+else:
+    initial_active_depth = default_initial_active_depth
+    growth_events = normalize_active_depth_schedule(default_growth_events)
+
+assert 1 <= initial_active_depth <= args.depth, (
+    f"--initial-active-depth must be in [1, {args.depth}], got {initial_active_depth}"
+)
+prev_depth = initial_active_depth
+prev_step = -1
+for event in growth_events:
+    event_step = int(event["step"])
+    target_depth = int(event["target_depth"])
+    assert event_step > prev_step, "Active-depth growth steps must be strictly increasing"
+    assert prev_depth < target_depth <= args.depth, (
+        f"Active-depth targets must be strictly increasing and <= {args.depth}, got {target_depth} after {prev_depth}"
+    )
+    prev_depth = target_depth
+    prev_step = event_step
+
+if depth_curriculum_meta is not None:
+    current_active_depth = int(depth_curriculum_meta.get("current_active_depth", initial_active_depth))
+    active_depth_growth_summary = depth_curriculum_meta.get("growth_summary")
+    next_growth_index = depth_curriculum_meta.get("next_growth_index")
+    if next_growth_index is None:
+        next_growth_index = len([
+            event for event in growth_events
+            if int(event["target_depth"]) <= int(current_active_depth)
+        ])
+else:
+    current_active_depth = initial_active_depth
+    active_depth_growth_summary = None
+    next_growth_index = len([
+        event for event in growth_events
+        if int(event["target_depth"]) <= int(current_active_depth)
+    ])
+model.set_active_depth(current_active_depth)
+if active_depth_growth_summary is not None:
+    restored_growth_state = model.restore_active_depth_growth(active_depth_growth_summary, args.resume_from_step)
+    active_depth_growth_summary = restored_growth_state
+if current_active_depth != args.depth or growth_events:
+    print0(f"Active depth schedule: starting with {current_active_depth}/{args.depth} layers")
+    for event in growth_events:
+        print0(f"Active depth event: step {int(event['step'])} -> {int(event['target_depth'])}/{args.depth}")
+    print0(f"Active depth new-layer init: {args.grow_new_layer_init}")
+    if args.grow_new_layer_scale != 1.0 or args.grow_new_layer_ramp_steps > 0:
+        print0(
+            f"Active depth grow-in: new layer scale starts at {args.grow_new_layer_scale:.3f}"
+            f" with ramp {args.grow_new_layer_ramp_steps} steps"
+        )
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -355,6 +473,10 @@ total_tokens = total_batch_size * num_iterations # the actual number of tokens w
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+for event in growth_events:
+    assert int(event["step"]) < num_iterations, (
+        f"Active-depth growth step {int(event['step'])} must be scheduled before the final step {num_iterations}"
+    )
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
@@ -414,6 +536,42 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Go!
 while True:
+    current_grow_scale = orig_model.update_active_depth_growth_scale(step)
+    if current_grow_scale is not None and active_depth_growth_summary is not None:
+        active_depth_growth_summary = dict(active_depth_growth_summary)
+        active_depth_growth_summary["current_scale"] = float(current_grow_scale)
+        active_depth_growth_summary["current_step"] = int(step)
+        live_growth_state = orig_model.get_active_depth_growth_state()
+        if live_growth_state is not None:
+            active_depth_growth_summary["new_layers"] = live_growth_state["new_layers"]
+        else:
+            active_depth_growth_summary = None
+
+    if next_growth_index < len(growth_events) and step == int(growth_events[next_growth_index]["step"]):
+        growth_event = growth_events[next_growth_index]
+        active_depth_growth_summary = orig_model.expand_active_depth(
+            int(growth_event["target_depth"]),
+            growth_step=step,
+            new_layer_scale=args.grow_new_layer_scale,
+            ramp_steps=args.grow_new_layer_ramp_steps,
+            new_layer_init=args.grow_new_layer_init,
+        )
+        current_grow_scale = active_depth_growth_summary.get("current_scale", args.grow_new_layer_scale)
+        current_active_depth = orig_model.get_active_depth()
+        next_growth_index += 1
+        print0(
+            f"Expanded active depth from {active_depth_growth_summary['source_depth']} "
+            f"to {active_depth_growth_summary['target_depth']} at step {step}"
+        )
+        print0(f"Active depth layer map: {active_depth_growth_summary['layer_map']}")
+        print0(f"Active depth new-layer init: {active_depth_growth_summary['new_layer_init']}")
+        if active_depth_growth_summary.get("zeroed_last_linears"):
+            print0(f"Active depth zeroL layers: {active_depth_growth_summary['zeroed_last_linears']}")
+        if active_depth_growth_summary["copied_value_embeds"]:
+            print0(f"Active depth value-embed map: {active_depth_growth_summary['copied_value_embeds']}")
+        model = torch.compile(orig_model, dynamic=False)
+        print0("Recompiled model after active-depth expansion")
+
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -489,6 +647,19 @@ while True:
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
                 "dataloader_state_dict": dataloader_state_dict,
+                "depth_curriculum": {
+                    "initial_active_depth": initial_active_depth,
+                    "grow_active_depth_at_step": growth_events[0]["step"] if len(growth_events) == 1 else -1,
+                    "grow_active_depth_to": growth_events[-1]["target_depth"] if growth_events else current_active_depth,
+                    "growth_events": growth_events,
+                    "grow_new_layer_init": args.grow_new_layer_init,
+                    "grow_new_layer_scale": args.grow_new_layer_scale,
+                    "grow_new_layer_ramp_steps": args.grow_new_layer_ramp_steps,
+                    "current_active_depth": current_active_depth,
+                    "next_growth_index": next_growth_index,
+                    "growth_applied": next_growth_index >= len(growth_events),
+                    "growth_summary": active_depth_growth_summary,
+                },
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
@@ -564,7 +735,12 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    active_depth_str = ""
+    if current_active_depth != args.depth or current_grow_scale is not None:
+        active_depth_str = f" | active_depth: {current_active_depth}"
+        if current_grow_scale is not None:
+            active_depth_str += f" scale: {current_grow_scale:.3f}"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}{active_depth_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -576,6 +752,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/active_depth": current_active_depth,
         }
         wandb_run.log(log_data)
 

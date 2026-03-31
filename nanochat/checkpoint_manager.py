@@ -103,6 +103,14 @@ def build_model(checkpoint_dir, step, device, phase):
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
+    depth_curriculum = meta_data.get("depth_curriculum")
+    if depth_curriculum is not None:
+        current_active_depth = depth_curriculum.get("current_active_depth")
+        if current_active_depth is not None:
+            model.set_active_depth(int(current_active_depth))
+        growth_summary = depth_curriculum.get("growth_summary")
+        if growth_summary is not None:
+            model.restore_active_depth_growth(growth_summary, meta_data.get("step", step))
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()

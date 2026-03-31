@@ -236,6 +236,9 @@ class MuonAdamW(torch.optim.Optimizer):
         params: list[Tensor] = group['params']
         if not params:
             return
+        active_mask = [p.grad is not None for p in params]
+        if not any(active_mask):
+            return
 
         # Get or create group-level buffers (stored in first param's state for convenience)
         p = params[0]
@@ -255,9 +258,26 @@ class MuonAdamW(torch.optim.Optimizer):
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
+        # Keep the stacked shape stable across inactive/active layer changes.
+        stacked_grads = torch.empty(num_params, *shape, dtype=dtype, device=device)
+        for idx, param in enumerate(params):
+            grad = param.grad
+            if grad is None:
+                stacked_grads[idx].zero_()
+            else:
+                stacked_grads[idx].copy_(grad)
         stacked_params = torch.stack(params)
+        inactive_positions = [idx for idx, is_active in enumerate(active_mask) if not is_active]
+        if inactive_positions:
+            inactive_idx = torch.tensor(inactive_positions, device=device, dtype=torch.long)
+            inactive_param_snapshot = stacked_params.index_select(0, inactive_idx).clone()
+            inactive_momentum_snapshot = momentum_buffer.index_select(0, inactive_idx).clone()
+            inactive_second_snapshot = second_momentum_buffer.index_select(0, inactive_idx).clone()
+        else:
+            inactive_idx = None
+            inactive_param_snapshot = None
+            inactive_momentum_snapshot = None
+            inactive_second_snapshot = None
 
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
@@ -278,6 +298,11 @@ class MuonAdamW(torch.optim.Optimizer):
             group["ns_steps"],
             red_dim,
         )
+
+        if inactive_idx is not None:
+            stacked_params.index_copy_(0, inactive_idx, inactive_param_snapshot)
+            momentum_buffer.index_copy_(0, inactive_idx, inactive_momentum_snapshot)
+            second_momentum_buffer.index_copy_(0, inactive_idx, inactive_second_snapshot)
 
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
@@ -373,6 +398,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 # Small params: all_reduce (no scatter/gather needed)
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
@@ -393,11 +420,26 @@ class DistMuonAdamW(torch.optim.Optimizer):
         padded_num_params = chunk_size * world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
+        active_mask = [param.grad is not None for param in params]
+
+        # If no params in this group are active, skip all communication and computation.
+        if not any(active_mask):
+            return dict(
+                future=None,
+                grad_chunk=None,
+                stacked_grads=None,
+                chunk_size=chunk_size,
+                active_mask=active_mask,
+            )
 
         # Stack grads and zero-pad to padded_num_params
-        grad_stack = torch.stack([p.grad for p in params])
         stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
+        for idx, param in enumerate(params):
+            grad = param.grad
+            if grad is None:
+                stacked_grads[idx].zero_()
+            else:
+                stacked_grads[idx].copy_(grad)
         if len(params) < padded_num_params:
             stacked_grads[len(params):].zero_()
 
@@ -405,12 +447,20 @@ class DistMuonAdamW(torch.optim.Optimizer):
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
 
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(
+            future=future,
+            grad_chunk=grad_chunk,
+            stacked_grads=stacked_grads,
+            chunk_size=chunk_size,
+            active_mask=active_mask,
+        )
 
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
         for p in group['params']:
+            if p not in param_infos:
+                continue
             pinfo = param_infos[p]
             pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']
@@ -450,9 +500,13 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
         """Wait for reduce, compute Muon updates, launch gather."""
-        info['future'].wait()
         params = group['params']
         chunk_size = info['chunk_size']
+        active_mask = info['active_mask']
+        if info['future'] is None:
+            return
+
+        info['future'].wait()
         grad_chunk = info['grad_chunk']
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
@@ -460,6 +514,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
         # How many params does this rank own?
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
+        active_owned_positions = [
+            local_idx for local_idx in range(num_owned)
+            if active_mask[start_idx + local_idx]
+        ]
 
         # Get or create group-level state
         state = self.state[p]
@@ -476,18 +534,44 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if num_owned > 0:
             owned_params = [params[start_idx + i] for i in range(num_owned)]
             stacked_owned = torch.stack(owned_params)
+            inactive_owned_positions = [
+                local_idx for local_idx in range(num_owned)
+                if local_idx not in active_owned_positions
+            ]
+        else:
+            stacked_owned = None
+            inactive_owned_positions = []
 
+        if active_owned_positions:
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
+            if inactive_owned_positions:
+                inactive_owned_idx = torch.tensor(inactive_owned_positions, device=device, dtype=torch.long)
+                inactive_param_snapshot = stacked_owned.index_select(0, inactive_owned_idx).clone()
+                inactive_momentum_snapshot = state["momentum_buffer"].index_select(0, inactive_owned_idx).clone()
+                inactive_second_snapshot = state["second_momentum_buffer"].index_select(0, inactive_owned_idx).clone()
+            else:
+                inactive_owned_idx = None
+                inactive_param_snapshot = None
+                inactive_momentum_snapshot = None
+                inactive_second_snapshot = None
             muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                grad_chunk[:num_owned],
+                stacked_owned,
+                state["momentum_buffer"][:num_owned],
+                state["second_momentum_buffer"][:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                 group["ns_steps"], red_dim,
             )
+            if inactive_owned_idx is not None:
+                stacked_owned.index_copy_(0, inactive_owned_idx, inactive_param_snapshot)
+                state["momentum_buffer"].index_copy_(0, inactive_owned_idx, inactive_momentum_snapshot)
+                state["second_momentum_buffer"].index_copy_(0, inactive_owned_idx, inactive_second_snapshot)
+
+        if stacked_owned is not None:
             updated_params[:num_owned].copy_(stacked_owned)
 
         if num_owned < chunk_size:

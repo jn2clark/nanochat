@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -145,9 +146,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, output_scale=1.0):
+        x = x + output_scale * self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + output_scale * self.mlp(norm(x))
         return x
 
 
@@ -197,6 +198,252 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        self.active_depth = config.n_layer
+        self.register_buffer("layer_output_scales", torch.ones(config.n_layer), persistent=False)
+        self._active_depth_growth_state = None
+        self._layer_activation_order = tuple(self._build_layer_activation_order(config.n_layer))
+
+    def set_active_depth(self, active_depth):
+        assert 1 <= active_depth <= self.config.n_layer, (
+            f"active_depth must be in [1, {self.config.n_layer}], got {active_depth}"
+        )
+        self.active_depth = active_depth
+
+    def get_active_depth(self):
+        return self.active_depth
+
+    def get_active_layer_indices(self):
+        return self._active_layer_indices_for_depth(self.active_depth)
+
+    @staticmethod
+    def _build_layer_activation_order(n_layer):
+        assert n_layer >= 1
+        if n_layer == 1:
+            return [0]
+        order = [0, n_layer - 1]
+        seen = set(order)
+        intervals = [(0, n_layer - 1)]
+        while intervals and len(order) < n_layer:
+            intervals.sort(key=lambda item: (-(item[1] - item[0]), item[0], item[1]))
+            left, right = intervals.pop(0)
+            if right - left <= 1:
+                continue
+            mid = (left + right) // 2
+            if mid not in seen:
+                order.append(mid)
+                seen.add(mid)
+            intervals.append((left, mid))
+            intervals.append((mid, right))
+        if len(order) < n_layer:
+            for layer_idx in range(n_layer):
+                if layer_idx not in seen:
+                    order.append(layer_idx)
+                    seen.add(layer_idx)
+        return order
+
+    def _active_layer_indices_for_depth(self, active_depth):
+        assert 1 <= active_depth <= self.config.n_layer
+        active_layers = sorted(self._layer_activation_order[:active_depth])
+        return tuple(active_layers)
+
+    @staticmethod
+    def _normalize_layer_map(layer_map):
+        return {int(target_layer): int(source_layer) for target_layer, source_layer in layer_map.items()}
+
+    @staticmethod
+    def _compute_growth_scale(initial_scale, ramp_steps, elapsed_steps):
+        elapsed_steps = max(int(elapsed_steps), 0)
+        initial_scale = float(initial_scale)
+        ramp_steps = int(ramp_steps)
+        if ramp_steps <= 0:
+            return initial_scale
+        frac = min(elapsed_steps / ramp_steps, 1.0)
+        return initial_scale + frac * (1.0 - initial_scale)
+
+    @torch.no_grad()
+    def clear_active_depth_growth_state(self):
+        self._active_depth_growth_state = None
+        self.layer_output_scales.data.fill_(1.0)
+
+    def get_active_depth_growth_state(self):
+        if self._active_depth_growth_state is None:
+            return None
+        state = dict(self._active_depth_growth_state)
+        state["layer_map"] = dict(state["layer_map"])
+        state["new_layers"] = list(state["new_layers"])
+        state["zeroed_last_linears"] = list(state.get("zeroed_last_linears", []))
+        return state
+
+    @torch.no_grad()
+    def update_active_depth_growth_scale(self, current_step):
+        if self._active_depth_growth_state is None:
+            return None
+        state = self._active_depth_growth_state
+        current_scale = self._compute_growth_scale(
+            state["new_layer_scale"],
+            state["ramp_steps"],
+            current_step - state["growth_step"],
+        )
+        self.layer_output_scales.data.fill_(1.0)
+        if state["new_layers"]:
+            new_layers = torch.tensor(
+                state["new_layers"],
+                device=self.layer_output_scales.device,
+                dtype=torch.long,
+            )
+            self.layer_output_scales.index_fill_(0, new_layers, current_scale)
+        state["current_scale"] = float(current_scale)
+        state["current_step"] = int(current_step)
+        if state["ramp_steps"] > 0 and current_scale >= 1.0 - 1e-8:
+            self.clear_active_depth_growth_state()
+            return 1.0
+        return float(current_scale)
+
+    @torch.no_grad()
+    def restore_active_depth_growth(self, growth_summary, current_step):
+        self.clear_active_depth_growth_state()
+        if not growth_summary:
+            return None
+        layer_map = self._normalize_layer_map(growth_summary.get("layer_map", {}))
+        new_layer_scale = float(growth_summary.get("new_layer_scale", 1.0))
+        ramp_steps = int(growth_summary.get("ramp_steps", 0))
+        raw_growth_step = growth_summary.get("growth_step", current_step)
+        growth_step = int(current_step if raw_growth_step is None else raw_growth_step)
+        if not layer_map or (new_layer_scale >= 1.0 and ramp_steps <= 0):
+            return None
+        self._active_depth_growth_state = {
+            "source_depth": int(growth_summary.get("source_depth", self.get_active_depth())),
+            "target_depth": int(growth_summary.get("target_depth", self.get_active_depth())),
+            "growth_step": growth_step,
+            "new_layer_scale": new_layer_scale,
+            "ramp_steps": ramp_steps,
+            "new_layer_init": growth_summary.get("new_layer_init", "copy"),
+            "layer_map": layer_map,
+            "new_layers": sorted(layer_map.keys()),
+            "zeroed_last_linears": list(growth_summary.get("zeroed_last_linears", [])),
+        }
+        self.update_active_depth_growth_scale(current_step)
+        return self.get_active_depth_growth_state()
+
+    def _expand_layer_map(self, source_depth, target_depth):
+        assert 1 <= source_depth <= target_depth
+        source_layers = self._active_layer_indices_for_depth(source_depth)
+        target_layers = self._active_layer_indices_for_depth(target_depth)
+        source_layer_set = set(source_layers)
+        new_layers = [layer_idx for layer_idx in target_layers if layer_idx not in source_layer_set]
+        if not new_layers:
+            return {}
+        mapping = {}
+        for target_layer in new_layers:
+            mapping[target_layer] = min(
+                source_layers,
+                key=lambda source_layer: (abs(source_layer - target_layer), source_layer),
+            )
+        return mapping
+
+    def _resolve_layer_copy_source(self, target_layer, source_active_layers, preferred_source):
+        target_keys = tuple(self.transformer.h[target_layer].state_dict().keys())
+        compatible_sources = [
+            source_layer
+            for source_layer in source_active_layers
+            if tuple(self.transformer.h[source_layer].state_dict().keys()) == target_keys
+        ]
+        if compatible_sources:
+            return min(
+                compatible_sources,
+                key=lambda source_layer: (abs(source_layer - preferred_source), abs(source_layer - target_layer)),
+            )
+        return preferred_source
+
+    @torch.no_grad()
+    def _copy_block_state(self, target_layer, source_layer):
+        target_block = self.transformer.h[target_layer]
+        source_state = self.transformer.h[source_layer].state_dict()
+        target_state = target_block.state_dict()
+        if source_state.keys() == target_state.keys():
+            target_block.load_state_dict(source_state)
+            return
+
+        merged_state = dict(target_state)
+        for name, value in source_state.items():
+            if name in merged_state and merged_state[name].shape == value.shape:
+                merged_state[name] = value
+        target_block.load_state_dict(merged_state)
+
+    @torch.no_grad()
+    def _apply_new_layer_init(self, target_layer, init_mode):
+        if init_mode == "copy":
+            return
+        if init_mode != "copy-zeroL":
+            raise ValueError(f"Unknown active-depth grow init mode: {init_mode}")
+        block = self.transformer.h[target_layer]
+        block.attn.c_proj.weight.zero_()
+        block.mlp.c_proj.weight.zero_()
+
+    @torch.no_grad()
+    def expand_active_depth(
+        self,
+        new_active_depth,
+        growth_step=None,
+        new_layer_scale=1.0,
+        ramp_steps=0,
+        new_layer_init="copy",
+    ):
+        source_depth = self.get_active_depth()
+        assert source_depth < new_active_depth <= self.config.n_layer, (
+            f"Can only expand active depth from {source_depth} to <= {self.config.n_layer}, got {new_active_depth}"
+        )
+        assert 0.0 <= new_layer_scale <= 1.0, (
+            f"new_layer_scale must be in [0.0, 1.0], got {new_layer_scale}"
+        )
+        assert new_layer_init in ("copy", "copy-zeroL"), (
+            f"new_layer_init must be one of ('copy', 'copy-zeroL'), got {new_layer_init}"
+        )
+        self.clear_active_depth_growth_state()
+        source_active_layers = self._active_layer_indices_for_depth(source_depth)
+        target_active_layers = self._active_layer_indices_for_depth(new_active_depth)
+        layer_map = self._expand_layer_map(source_depth, new_active_depth)
+        copied_value_embeds = {}
+        zeroed_last_linears = []
+        for target_layer, mapped_source_layer in list(layer_map.items()):
+            source_layer = self._resolve_layer_copy_source(target_layer, source_active_layers, mapped_source_layer)
+            layer_map[target_layer] = source_layer
+            self._copy_block_state(target_layer, source_layer)
+            self._apply_new_layer_init(target_layer, new_layer_init)
+            if new_layer_init == "copy-zeroL":
+                zeroed_last_linears.append(target_layer)
+            source_ve = str(source_layer)
+            target_ve = str(target_layer)
+            if source_ve in self.value_embeds and target_ve in self.value_embeds:
+                self.value_embeds[target_ve].load_state_dict(self.value_embeds[source_ve].state_dict())
+                copied_value_embeds[target_layer] = source_layer
+            self.resid_lambdas.data[target_layer] = self.resid_lambdas.data[source_layer]
+            self.x0_lambdas.data[target_layer] = self.x0_lambdas.data[source_layer]
+        self.set_active_depth(new_active_depth)
+        growth_summary = {
+            "source_depth": source_depth,
+            "target_depth": new_active_depth,
+            "layer_map": layer_map,
+            "copied_blocks": len(layer_map),
+            "copied_value_embeds": copied_value_embeds,
+            "source_active_layers": list(source_active_layers),
+            "target_active_layers": list(target_active_layers),
+            "growth_step": None if growth_step is None else int(growth_step),
+            "new_layer_scale": float(new_layer_scale),
+            "ramp_steps": int(ramp_steps),
+            "new_layer_init": new_layer_init,
+            "zeroed_last_linears": zeroed_last_linears,
+        }
+        restored_growth_state = None
+        if new_layer_scale < 1.0 or ramp_steps > 0:
+            restored_growth_state = self.restore_active_depth_growth(
+                growth_summary,
+                current_step=0 if growth_step is None else growth_step,
+            )
+        if restored_growth_state is not None:
+            growth_summary["current_scale"] = restored_growth_state["current_scale"]
+            growth_summary["new_layers"] = restored_growth_state["new_layers"]
+        return growth_summary
 
     @torch.no_grad()
     def init_weights(self):
@@ -445,13 +692,14 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        active_layers = self.get_active_layer_indices()
+        backout_layer = active_layers[len(active_layers) // 2]  # cache at halfway point of the active stack
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
+        for i in active_layers:
+            block = self.transformer.h[i]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, output_scale=self.layer_output_scales[i])
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
